@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VisualATC – ATC Stream Transcriber</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header id="header">
+      <div class="header-left">
+        <h1>VisualATC</h1>
+        <span class="subtitle">ATC Stream Transcriber</span>
+      </div>
+      <div class="header-right">
+        <span id="status-badge" class="badge badge-idle">Idle</span>
+        <span id="audio-time" class="stat">0:00:00</span>
+      </div>
+    </header>
+
+    <!-- Setup Panel (shown when no active session) -->
+    <div id="setup-panel">
+      <div class="setup-card">
+        <h2>Start Transcribing</h2>
+        <p class="disclaimer">Provide a stream URL you have permission to use. Transcripts may be inaccurate and are not for operational use.</p>
+
+        <!-- Input mode tabs -->
+        <div class="input-tabs">
+          <button class="tab-btn active" data-mode="stream" onclick="setInputMode('stream')">Stream URL</button>
+          <button class="tab-btn" data-mode="file" onclick="setInputMode('file')">Upload File</button>
+        </div>
+
+        <!-- Stream URL input -->
+        <div id="stream-input" class="input-group">
+          <label for="stream-url">Audio Stream URL</label>
+          <input type="url" id="stream-url" placeholder="https://example.com/stream" autocomplete="off">
+          <small>Icecast, Shoutcast, HLS, or direct HTTP audio stream</small>
+        </div>
+
+        <!-- File upload input -->
+        <div id="file-input" class="input-group" style="display:none">
+          <label for="file-upload">Audio File</label>
+          <input type="file" id="file-upload" accept=".mp3,.wav,.ogg,.flac,.m4a,.aac">
+          <small>.mp3, .wav, .ogg, .flac, .m4a supported</small>
+        </div>
+
+        <!-- Model selection -->
+        <div class="input-group">
+          <label for="model-select">Whisper Model</label>
+          <select id="model-select">
+            <option value="tiny">Tiny (~75MB, fastest, lower accuracy)</option>
+            <option value="base">Base (~150MB, fast, medium accuracy)</option>
+            <option value="small" selected>Small (~500MB, medium speed, good accuracy)</option>
+          </select>
+        </div>
+
+        <!-- Confirmation checkbox -->
+        <div class="input-group checkbox-group">
+          <label>
+            <input type="checkbox" id="permission-check">
+            I confirm I have permission to use this audio source
+          </label>
+        </div>
+
+        <!-- Start button -->
+        <button id="start-btn" class="btn btn-primary" onclick="startSession()" disabled>
+          Start Transcribing
+        </button>
+
+        <!-- Bookmarks -->
+        <div id="bookmarks-section">
+          <h3>Saved Feeds</h3>
+          <div id="bookmarks-list"></div>
+          <div class="bookmark-add" id="bookmark-add-form" style="display:none">
+            <input type="text" id="bookmark-label" placeholder="Label (e.g., My Local Tower)">
+            <button class="btn btn-small" onclick="saveBookmark()">Save Current URL</button>
+          </div>
+          <button class="btn btn-small btn-outline" onclick="toggleBookmarkForm()">+ Add Bookmark</button>
+        </div>
+      </div>
+
+      <!-- Existing projects note -->
+      <div class="setup-card info-card">
+        <h3>Related Open-Source Projects</h3>
+        <p>Other projects that may interest you:</p>
+        <ul>
+          <li><strong>ATLAS</strong> – Real-time ATC transcription with Docker deployment (github.com/amidstdebug/atlas)</li>
+          <li><strong>WhisperATC</strong> – Fine-tuned Whisper models for ATC audio (github.com/jlvdoorn/WhisperATC)</li>
+          <li><strong>jack-tol/fine-tuning-whisper-on-atc-data</strong> – 84% improvement in ATC transcription accuracy</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Live View (shown during active session) -->
+    <div id="live-view" style="display:none">
+      <!-- Controls bar -->
+      <div id="controls-bar">
+        <div class="controls-left">
+          <button id="pause-btn" class="btn btn-small" onclick="togglePause()">Pause</button>
+          <button id="stop-btn" class="btn btn-small btn-danger" onclick="stopSession()">Stop</button>
+          <button class="btn btn-small btn-outline" onclick="exportTxt()">Export .txt</button>
+          <button class="btn btn-small btn-outline" onclick="exportJson()">Export .json</button>
+        </div>
+        <div class="controls-right">
+          <span id="stats-display">
+            <span class="stat">Segments: <strong id="stat-segments">0</strong></span>
+            <span class="stat">Flights: <strong id="stat-flights">0</strong></span>
+            <span class="stat">Events: <strong id="stat-events">0</strong></span>
+            <span class="stat">Audio: <strong id="stat-audio">0:00</strong></span>
+          </span>
+        </div>
+      </div>
+
+      <!-- Main layout: transcript + sidebar -->
+      <div id="main-layout">
+        <!-- Transcript panel -->
+        <div id="transcript-panel">
+          <div class="panel-header">
+            <h2>Live Transcript</h2>
+            <div class="filter-bar">
+              <input type="text" id="transcript-filter" placeholder="Filter by callsign or text..." oninput="filterTranscript()">
+              <button class="btn btn-tiny" onclick="clearTranscriptFilter()">Clear</button>
+            </div>
+          </div>
+          <div id="transcript-feed" class="scroll-container">
+            <div class="empty-state">Waiting for audio...</div>
+          </div>
+        </div>
+
+        <!-- Sidebar: flight cards + events -->
+        <div id="sidebar">
+          <!-- Flight Cards -->
+          <div id="flight-cards-panel">
+            <div class="panel-header">
+              <h2>Flight Cards</h2>
+              <span id="flight-count" class="count-badge">0</span>
+            </div>
+            <div class="sort-bar">
+              <button class="btn btn-tiny active" onclick="sortFlightCards('recent')">Recent</button>
+              <button class="btn btn-tiny" onclick="sortFlightCards('frequent')">Frequent</button>
+              <button class="btn btn-tiny" onclick="sortFlightCards('alpha')">A-Z</button>
+            </div>
+            <div id="flight-cards-list" class="scroll-container">
+              <div class="empty-state">No flights detected yet</div>
+            </div>
+          </div>
+
+          <!-- Events Timeline -->
+          <div id="events-panel">
+            <div class="panel-header">
+              <h2>Events</h2>
+              <span id="event-count" class="count-badge">0</span>
+            </div>
+            <div id="events-filter-bar">
+              <select id="event-type-filter" onchange="filterEvents()">
+                <option value="">All Events</option>
+                <option value="GO_AROUND">Go Around</option>
+                <option value="DIVERT">Divert</option>
+                <option value="HOLD">Hold</option>
+                <option value="HOLD_SHORT">Hold Short</option>
+                <option value="EMERGENCY">Emergency</option>
+                <option value="MAYDAY">Mayday</option>
+                <option value="PAN_PAN">Pan-Pan</option>
+                <option value="WINDSHEAR">Windshear</option>
+                <option value="MINIMUM_FUEL">Minimum Fuel</option>
+                <option value="RUNWAY_CHANGE">Runway Change</option>
+              </select>
+            </div>
+            <div id="events-list" class="scroll-container">
+              <div class="empty-state">No events detected yet</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Status overlay for loading -->
+    <div id="status-overlay" style="display:none">
+      <div class="overlay-content">
+        <div class="spinner"></div>
+        <p id="status-message">Loading model...</p>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
