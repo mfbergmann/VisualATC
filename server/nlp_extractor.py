@@ -19,9 +19,9 @@ logger = logging.getLogger("visualatc.nlp")
 WORD_TO_DIGIT = {
     "zero": "0", "oh": "0",
     "one": "1", "won": "1",
-    "two": "2", "to": "2", "too": "2",
+    "two": "2",
     "three": "3", "tree": "3",
-    "four": "4", "for": "4", "fore": "4",
+    "four": "4",
     "five": "5", "fife": "5",
     "six": "6",
     "seven": "7",
@@ -54,12 +54,16 @@ SINGLE_DIGIT_WORDS = (
     r"(?:zero|oh|one|two|three|tree|four|five|fife|six|seven|eight|ait|nine|niner)"
 )
 
+# Number-like token: digit words, actual digits, or digits with hyphens
+NUMBER_TOKEN = (
+    r"(?:" + SINGLE_DIGIT_WORDS + r"|\d[\d\-]*\d|\d)"
+)
+
 # NATO phonetic alphabet
 NATO_PHONETIC = {
     "alfa": "A", "alpha": "A",
     "bravo": "B",
     "charlie": "C",
-    "delta letter": "D",  # "delta" alone is airline
     "echo": "E",
     "foxtrot": "F", "fox trot": "F",
     "golf": "G",
@@ -84,28 +88,98 @@ NATO_PHONETIC = {
     "zulu": "Z",
 }
 
-# Reverse: letter -> NATO word (for matching "november one two three alpha bravo")
-NATO_LETTERS = {v: k for k, v in NATO_PHONETIC.items()}
-
 # Direction suffixes for runways
 RUNWAY_SUFFIX = {"left": "L", "right": "R", "center": "C", "centre": "C"}
+
+# Common Whisper mistranscriptions of airline names
+AIRLINE_ALIASES = {
+    # Whisper often hears these wrong
+    "national air": "ACA",     # "Air Canada" misheard
+    "air canada": "ACA",
+    "canadi'n": "ACA",
+    "jazz": "JZA",
+    "jazz air": "JZA",
+    "delta": "DAL",
+    "american": "AAL",
+    "united": "UAL",
+    "southwest": "SWA",
+    "south west": "SWA",
+    "jetblue": "JBU",
+    "jet blue": "JBU",
+    "alaska": "ASA",
+    "spirit": "NKS",
+    "frontier": "FFT",
+    "westjet": "WJA",
+    "west jet": "WJA",
+    "endeavor": "EDV",
+    "envoy": "ENY",
+    "republic": "RPA",
+    "brickyard": "RPA",
+    "skywest": "SKW",
+    "sky west": "SKW",
+    "mesa": "ASH",
+    "cactus": "AWE",
+    "speedbird": "BAW",
+    "air france": "AFR",
+    "lufthansa": "DLH",
+    "emirates": "UAE",
+    "fedex": "FDX",
+    "ups": "UPS",
+    "giant": "GTI",
+    "atlas": "GTI",
+    "atlas air": "GTI",
+    "hawaiian": "HAL",
+    "allegiant": "AAY",
+    "sun country": "SCX",
+    "porter": "POE",
+    "sunwing": "SWG",
+    "flair": "FLE",
+    "air transat": "TSC",
+}
 
 # ---------------------------------------------------------------------------
 # Event keyword patterns
 # ---------------------------------------------------------------------------
 
 EVENT_PATTERNS: list[tuple[str, EventType]] = [
-    (r"\bgo[\s-]?around\b", EventType.GO_AROUND),
+    (r"\bgo[\s\-]?around\b", EventType.GO_AROUND),
+    (r"\bmissed\s+approach\b", EventType.GO_AROUND),
     (r"\bdivert(?:ing|ed|s)?\b|\bdiversion\b|\balternate\b", EventType.DIVERT),
     (r"\bhold(?:ing)?\s+short\b", EventType.HOLD_SHORT),
-    (r"\b(?:hold(?:ing)?|enter(?:ing)?\s+hold)\b", EventType.HOLD),
-    (r"\brunway\s+change\b|\blanding\s+runway\b", EventType.RUNWAY_CHANGE),
-    (r"\bwind\s*shear\b", EventType.WINDSHEAR),
+    (r"\b(?:hold(?:ing)?(?:\s+pattern)?|enter(?:ing)?\s+hold)\b", EventType.HOLD),
+    (r"\brunway\s+change\b|\blanding\s+runway\b|\bchange\s+runway\b", EventType.RUNWAY_CHANGE),
+    (r"\bwind\s*shear\b|\bmicroburst\b", EventType.WINDSHEAR),
     (r"\bminimum\s+fuel\b", EventType.MINIMUM_FUEL),
     (r"\bmayday\b", EventType.MAYDAY),
-    (r"\bpan[\s-]?pan\b", EventType.PAN_PAN),
-    (r"\bemergency\b|\bdeclare(?:s|d)?\s+emergency\b", EventType.EMERGENCY),
+    (r"\bpan[\s\-]?pan\b", EventType.PAN_PAN),
+    (r"\bemergency\b|\bdeclare(?:s|d)?\s+emergency\b|\bsquawk(?:ing)?\s+7700\b", EventType.EMERGENCY),
 ]
+
+
+def _strip_hyphens_to_digits(s: str) -> str:
+    """Convert '1-3-2-0' or '31-92' to '13200' or '3192'."""
+    return re.sub(r"[\-\s]", "", s)
+
+
+def _mixed_to_digits(text: str) -> str:
+    """Convert a mixed sequence of digit words and actual digits to a digit string.
+
+    Handles: 'eight eight five three', '8853', '1-3-2-0', 'one eight zero',
+    'eight 8 five 3', etc.
+    """
+    # First strip hyphens from digit groups
+    text = re.sub(r"(\d)[\-](\d)", r"\1\2", text)
+    tokens = text.lower().split()
+    result = []
+    for token in tokens:
+        if token in WORD_TO_DIGIT:
+            result.append(WORD_TO_DIGIT[token])
+        elif re.match(r"^\d+$", token):
+            result.append(token)
+        elif token in NATO_PHONETIC:
+            result.append(NATO_PHONETIC[token])
+        # Skip unrecognized
+    return "".join(result)
 
 
 class ATCExtractor:
@@ -114,33 +188,51 @@ class ATCExtractor:
     def __init__(self, telephony_path: Optional[str] = None):
         if telephony_path is None:
             telephony_path = str(Path(__file__).parent / "data" / "airline_telephony.json")
+
+        # Load telephony from file and merge with built-in aliases
         self.telephony_map = self._load_telephony(telephony_path)
+        for alias, icao in AIRLINE_ALIASES.items():
+            if alias not in self.telephony_map:
+                self.telephony_map[alias] = icao
+
         # Build regex for telephony names (longest first to avoid partial matches)
         names = sorted(self.telephony_map.keys(), key=len, reverse=True)
         if names:
             escaped = [re.escape(n) for n in names]
+            # Match: airline name + (digit words / actual digits / hyphenated digits)
             self._telephony_re = re.compile(
                 r"\b(" + "|".join(escaped) + r")\s+"
-                r"((?:" + SINGLE_DIGIT_WORDS + r"|\d)+(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d))*)",
+                r"((?:" + SINGLE_DIGIT_WORDS + r"|\d[\d\-]*(?:\d)?"
+                r")(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d[\d\-]*(?:\d)?))*"
+                r"(?:\s+(?:heavy|super))?)",
                 re.IGNORECASE,
             )
         else:
             self._telephony_re = None
 
-        # Pattern for alphanumeric callsigns: AAA1234, N123AB
+        # Pattern for alphanumeric callsigns already in text: "ACA8853", "N123AB", "DAL123"
         self._alpha_callsign_re = re.compile(
             r"\b([A-Z]{2,4}\d{1,5}[A-Z]{0,2})\b"
         )
 
-        # Pattern for "November" style GA callsigns: November 1 2 3 Alpha Bravo
+        # Pattern for "November" style GA callsigns
         nato_letter_words = "|".join(
-            sorted([k for k in NATO_PHONETIC.keys() if k != "delta letter"],
-                   key=len, reverse=True)
+            sorted(NATO_PHONETIC.keys(), key=len, reverse=True)
         )
         self._ga_callsign_re = re.compile(
             r"\b(november)\s+"
-            r"((?:" + SINGLE_DIGIT_WORDS + r"|\d|" + nato_letter_words + r")"
-            r"(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d|" + nato_letter_words + r"))*)",
+            r"((?:" + SINGLE_DIGIT_WORDS + r"|\d[\d\-]*\d?|" + nato_letter_words + r")"
+            r"(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d[\d\-]*\d?|" + nato_letter_words + r"))*)",
+            re.IGNORECASE,
+        )
+
+        # Pattern for standalone flight-number-like patterns when preceded by
+        # ATC verbiage: e.g., "cleared to land 697" or "contact ground 697"
+        # We look for a 3-4 digit number that could be a flight number
+        self._standalone_flight_re = re.compile(
+            r"(?:cleared|contact|taxi|hold|turn|descend|climb|maintain|roger|copy"
+            r"|squawk|ident|say again|read back|good day)"
+            r"[^.]{0,30}?\b(\d{3,4})\b",
             re.IGNORECASE,
         )
 
@@ -155,41 +247,10 @@ class ATCExtractor:
         try:
             with open(path, "r") as f:
                 data = json.load(f)
-            # Remove comment keys
             return {k.lower(): v for k, v in data.items() if not k.startswith("_")}
         except Exception as e:
             logger.warning("Failed to load telephony map from %s: %s", path, e)
             return {}
-
-    def _words_to_digits(self, text: str) -> str:
-        """Convert a sequence of spoken number words to a digit string."""
-        tokens = text.lower().split()
-        digits = []
-        for token in tokens:
-            if token in WORD_TO_DIGIT:
-                d = WORD_TO_DIGIT[token]
-                digits.append(d)
-            elif token.isdigit():
-                digits.append(token)
-            elif token in NATO_PHONETIC:
-                digits.append(NATO_PHONETIC[token])
-            # Skip unrecognized words
-        return "".join(digits)
-
-    def _words_to_number_string(self, text: str) -> str:
-        """Convert spoken ATC number words to concatenated digits.
-
-        'one eight' => '18', 'two zero' => '20', 'niner' => '9'
-        """
-        tokens = text.lower().split()
-        result = []
-        for token in tokens:
-            if token in WORD_TO_DIGIT:
-                val = WORD_TO_DIGIT[token]
-                result.append(val)
-            elif token.isdigit():
-                result.append(token)
-        return "".join(result)
 
     def extract_callsigns(self, text: str) -> list[dict]:
         """
@@ -200,21 +261,36 @@ class ATCExtractor:
         results = []
         seen_spans = set()
 
+        def _overlaps(span):
+            for s in seen_spans:
+                if s[0] <= span[0] < s[1] or s[0] < span[1] <= s[1]:
+                    return True
+                if span[0] <= s[0] < span[1] or span[0] < s[1] <= span[1]:
+                    return True
+            return False
+
         # 1. Airline telephony + numbers: "Air Canada eight eight five three"
+        #    or "Delta 1-3-2-0" or "United 237"
         if self._telephony_re:
             for m in self._telephony_re.finditer(text):
                 span = (m.start(), m.end())
-                if span in seen_spans:
+                if _overlaps(span):
                     continue
-                seen_spans.add(span)
 
                 airline_name = m.group(1).lower()
                 number_part = m.group(2)
+
+                # Strip "heavy"/"super" suffix
+                clean_number = re.sub(r"\s+(?:heavy|super)\s*$", "", number_part, flags=re.IGNORECASE)
+                weight_class = number_part[len(clean_number):].strip()
+
                 icao_prefix = self.telephony_map.get(airline_name, airline_name.upper()[:3])
-                digits = self._words_to_number_string(number_part)
+                digits = _mixed_to_digits(clean_number)
+
                 if digits:
                     canonical = f"{icao_prefix}{digits}"
                     alias = m.group(0).strip()
+                    seen_spans.add(span)
                     results.append({
                         "canonical": canonical,
                         "alias": alias,
@@ -224,38 +300,75 @@ class ATCExtractor:
         # 2. GA callsigns: "November one two three alpha bravo"
         for m in self._ga_callsign_re.finditer(text):
             span = (m.start(), m.end())
-            if any(s[0] <= span[0] < s[1] or s[0] < span[1] <= s[1] for s in seen_spans):
+            if _overlaps(span):
                 continue
-            seen_spans.add(span)
 
             rest = m.group(2)
-            suffix = self._words_to_digits(rest)
-            canonical = f"N{suffix}"
-            alias = m.group(0).strip()
-            results.append({
-                "canonical": canonical,
-                "alias": alias,
-                "span": span,
-            })
+            suffix = _mixed_to_digits(rest)
+            if suffix:
+                canonical = f"N{suffix}"
+                alias = m.group(0).strip()
+                seen_spans.add(span)
+                results.append({
+                    "canonical": canonical,
+                    "alias": alias,
+                    "span": span,
+                })
 
-        # 3. Alphanumeric callsigns already in text: "ACA8853", "N123AB", "DAL123"
+        # 3. Alphanumeric callsigns in text: "ACA8853", "N123AB", "DAL123"
         for m in self._alpha_callsign_re.finditer(text.upper()):
-            # Map to original text positions
-            upper_text = text.upper()
-            start = text.upper().find(m.group(0))
-            if start == -1:
+            start = 0
+            search_text = text.upper()
+            # Find position in original text
+            pos = search_text.find(m.group(0), start)
+            if pos == -1:
                 continue
-            span = (start, start + len(m.group(0)))
-            if any(s[0] <= span[0] < s[1] or s[0] < span[1] <= s[1] for s in seen_spans):
+            span = (pos, pos + len(m.group(0)))
+            if _overlaps(span):
                 continue
-            seen_spans.add(span)
 
             cs = m.group(1)
-            # Only accept if it looks like a real callsign (has both letters and digits)
+            # Must have both letters and digits
             if re.search(r"[A-Z]", cs) and re.search(r"\d", cs):
+                # Filter out things that look like runway designations or frequencies
+                if re.match(r"^\d{2,3}[LRC]?$", cs):
+                    continue
+                seen_spans.add(span)
                 results.append({
                     "canonical": cs,
                     "alias": cs,
+                    "span": span,
+                })
+
+        # 4. Whisper often writes "airline + space + digits" without the exact
+        #    telephony match working (e.g., "National Air 1320").
+        #    Scan for "<Known Airline> <digits>" with the digits possibly
+        #    containing hyphens or spaces
+        for m in re.finditer(
+            r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(\d[\d\-\s]{0,10}\d|\d{2,5})\b",
+            text,
+        ):
+            span = (m.start(), m.end())
+            if _overlaps(span):
+                continue
+
+            name = m.group(1).lower()
+            num_raw = m.group(2)
+
+            # Check if this name is a known airline
+            icao = self.telephony_map.get(name)
+            if not icao:
+                # Try two-word lookup
+                continue
+
+            digits = _strip_hyphens_to_digits(num_raw)
+            if digits and len(digits) >= 2:
+                canonical = f"{icao}{digits}"
+                alias = m.group(0).strip()
+                seen_spans.add(span)
+                results.append({
+                    "canonical": canonical,
+                    "alias": alias,
                     "span": span,
                 })
 
@@ -265,47 +378,74 @@ class ATCExtractor:
         """Extract runway designation from text."""
         text_lower = text.lower()
 
-        # "runway two zero left" or "runway 20L"
+        # Match: "runway" + number words/digits + optional L/R/C
+        # Also handle Whisper oddities like "runway 2S" → "runway 25"
         m = re.search(
             r"runway\s+"
-            r"((?:" + SINGLE_DIGIT_WORDS + r"|\d)(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d))*)"
-            r"(?:\s*(left|right|center|centre|l|r|c))?",
+            r"((?:" + SINGLE_DIGIT_WORDS + r"|\d[\d\-]*\d?)"
+            r"(?:[\s\-]+(?:" + SINGLE_DIGIT_WORDS + r"|\d[\d\-]*\d?))*)"
+            r"(?:[\s\-]*(left|right|center|centre|l|r|c))?",
             text_lower,
         )
         if m:
-            num = self._words_to_number_string(m.group(1))
+            num = _mixed_to_digits(m.group(1))
             suffix = ""
             if m.group(2):
                 s = m.group(2).lower()
                 suffix = RUNWAY_SUFFIX.get(s, s.upper()[0] if s else "")
             if num:
                 return f"{num}{suffix}"
+
+        # Also try to match bare digit-based runway mentions: "two zero left"
+        # after "cleared to land", "cleared for takeoff", etc.
+        m = re.search(
+            r"(?:cleared (?:to land|for (?:takeoff|the option|the visual))|"
+            r"departing|landing)\s+(?:runway\s+)?"
+            r"((?:" + SINGLE_DIGIT_WORDS + r"|\d[\d\-]*\d?)"
+            r"(?:[\s\-]+(?:" + SINGLE_DIGIT_WORDS + r"|\d[\d\-]*\d?))*)"
+            r"(?:[\s\-]*(left|right|center|centre|l|r|c))?",
+            text_lower,
+        )
+        if m:
+            num = _mixed_to_digits(m.group(1))
+            suffix = ""
+            if m.group(2):
+                s = m.group(2).lower()
+                suffix = RUNWAY_SUFFIX.get(s, s.upper()[0] if s else "")
+            if num and 1 <= len(num) <= 2:
+                return f"{num}{suffix}"
+
         return None
 
     def extract_altitude(self, text: str) -> Optional[str]:
         """Extract altitude from text."""
         text_lower = text.lower()
 
-        patterns = [
-            r"(?:maintain|climb(?:\s+and\s+maintain)?|descend(?:\s+and\s+maintain)?|at)\s+"
-            r"((?:flight\s+level\s+)?(?:" + SINGLE_DIGIT_WORDS + r"|\d)(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d|thousand|hundred))*)",
-        ]
-        for pat in patterns:
-            m = re.search(pat, text_lower)
-            if m:
-                raw = m.group(1)
-                if "flight level" in raw:
-                    raw = raw.replace("flight level", "").strip()
-                    digits = self._words_to_number_string(raw)
-                    if digits:
-                        return f"FL{digits}"
-                else:
-                    digits = self._words_to_number_string(raw)
-                    if digits:
-                        # If "thousand" was in original, multiply
-                        if "thousand" in m.group(1).lower():
-                            return f"{digits}ft"
-                        return f"{digits}ft" if len(digits) <= 3 else f"{digits}ft"
+        # Flight level
+        m = re.search(
+            r"flight\s+level\s+"
+            r"((?:" + SINGLE_DIGIT_WORDS + r"|\d)(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d))*)",
+            text_lower,
+        )
+        if m:
+            digits = _mixed_to_digits(m.group(1))
+            if digits:
+                return f"FL{digits}"
+
+        # "maintain/climb and maintain/descend and maintain" + altitude
+        m = re.search(
+            r"(?:maintain|climb(?:\s+and\s+maintain)?|descend(?:\s+and\s+maintain)?)\s+"
+            r"((?:" + SINGLE_DIGIT_WORDS + r"|\d)(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d|thousand|hundred))*)",
+            text_lower,
+        )
+        if m:
+            raw = m.group(1)
+            digits = _mixed_to_digits(raw)
+            if digits:
+                if "thousand" in raw:
+                    return f"{digits}ft"
+                return f"{digits}ft"
+
         return None
 
     def extract_heading(self, text: str) -> Optional[str]:
@@ -317,23 +457,23 @@ class ATCExtractor:
             text_lower,
         )
         if m:
-            digits = self._words_to_number_string(m.group(1))
+            digits = _mixed_to_digits(m.group(1))
             if digits:
-                return f"{digits}°"
+                return f"{digits}\u00b0"
         return None
 
     def extract_speed(self, text: str) -> Optional[str]:
         """Extract speed from text."""
         text_lower = text.lower()
         m = re.search(
-            r"(?:speed|reduce\s+speed(?:\s+to)?|maintain\s+speed|increase\s+speed(?:\s+to)?)\s+"
+            r"(?:speed|reduce\s+speed(?:\s+to)?|maintain\s+(?:\w+\s+)?speed|increase\s+speed(?:\s+to)?)\s+"
             r"(?:to\s+)?"
             r"((?:" + SINGLE_DIGIT_WORDS + r"|\d)(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d))*)"
             r"(?:\s*(?:knots|kts))?",
             text_lower,
         )
         if m:
-            digits = self._words_to_number_string(m.group(1))
+            digits = _mixed_to_digits(m.group(1))
             if digits:
                 return f"{digits}kts"
         return None
@@ -341,14 +481,22 @@ class ATCExtractor:
     def extract_frequency(self, text: str) -> Optional[str]:
         """Extract frequency from text."""
         text_lower = text.lower()
+
+        # "contact [facility] on 124.6" or "contact [facility] one two four point six"
         m = re.search(
-            r"(?:contact|monitor|frequency)\s+\w+\s+(?:on\s+)?"
-            r"((?:" + SINGLE_DIGIT_WORDS + r"|\d)(?:\s+(?:" + SINGLE_DIGIT_WORDS + r"|\d|point|decimal|\.))*)",
+            r"(?:contact|monitor)\s+\w+(?:\s+\w+)?\s+(?:on\s+)?"
+            r"((?:" + SINGLE_DIGIT_WORDS + r"|\d)(?:[\s\.](?:" + SINGLE_DIGIT_WORDS + r"|\d|point|decimal))*)",
             text_lower,
         )
+        if not m:
+            # Try bare frequency pattern: "one two four point six"
+            m = re.search(
+                r"\b(\d{2,3}[\.\s]\d{1,2})\b",
+                text_lower,
+            )
+
         if m:
             raw = m.group(1)
-            # Replace "point" / "decimal" with "."
             raw = re.sub(r"\bpoint\b|\bdecimal\b", ".", raw)
             tokens = raw.split()
             freq_str = ""
@@ -357,7 +505,7 @@ class ATCExtractor:
                     freq_str += "."
                 elif t in WORD_TO_DIGIT:
                     freq_str += WORD_TO_DIGIT[t]
-                elif t.replace(".", "").isdigit():
+                elif re.match(r"^[\d\.]+$", t):
                     freq_str += t
             if freq_str:
                 return freq_str

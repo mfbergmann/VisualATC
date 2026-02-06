@@ -81,7 +81,7 @@ function handleWSMessage(msg) {
       }
       break;
     case 'started':
-      onSessionStarted(msg.session_id);
+      onSessionStarted(msg.session_id, msg.stream_url);
       break;
     case 'stopped':
       onSessionStopped(msg);
@@ -177,7 +177,7 @@ async function startSession() {
   }
 }
 
-function onSessionStarted(sessionId) {
+function onSessionStarted(sessionId, streamUrl) {
   sessionActive = true;
   isPaused = false;
   transcriptSegments = [];
@@ -193,6 +193,18 @@ function onSessionStarted(sessionId) {
   renderTranscript();
   renderFlightCards();
   renderEvents();
+
+  // Set up audio player – use the proxy endpoint so the browser can play it
+  const audioPlayer = document.getElementById('audio-player');
+  const audioWrapper = document.getElementById('audio-player-wrapper');
+  if (streamUrl && inputMode === 'stream') {
+    audioPlayer.src = '/api/audio-proxy';
+    audioWrapper.style.display = 'inline-block';
+    // Don't autoplay – let user click play when ready
+  } else {
+    audioWrapper.style.display = 'none';
+    audioPlayer.src = '';
+  }
 }
 
 function onSessionStopped(msg) {
@@ -200,6 +212,12 @@ function onSessionStopped(msg) {
   isPaused = false;
   stopAudioTimer();
   setStatusBadge('stopped');
+
+  // Stop audio player
+  const audioPlayer = document.getElementById('audio-player');
+  audioPlayer.pause();
+  audioPlayer.src = '';
+  document.getElementById('audio-player-wrapper').style.display = 'none';
 
   if (msg.session_dir) {
     console.log('Session saved to:', msg.session_dir);

@@ -11,11 +11,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .audio_ingest import AudioIngest, save_upload
+from .audio_ingest import AudioIngest, USER_AGENT, resolve_playlist_url, save_upload
 from .models import (
     ATCEvent,
     EventType,
@@ -54,6 +55,7 @@ extractor = ATCExtractor()
 audio_ingest: Optional[AudioIngest] = None
 transcription_task: Optional[asyncio.Task] = None
 connected_websockets: list[WebSocket] = []
+resolved_stream_url: Optional[str] = None  # actual stream URL after playlist resolution
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +200,7 @@ async def index():
 @app.post("/api/start")
 async def start_session(req: StartRequest):
     """Start a new transcription session from a stream URL."""
-    global transcriber, audio_ingest, transcription_task
+    global transcriber, audio_ingest, transcription_task, resolved_stream_url
 
     # Stop any existing session
     await _stop_session()
@@ -223,12 +225,23 @@ async def start_session(req: StartRequest):
     )
     await audio_ingest.start()
 
+    # Store resolved URL for the audio proxy
+    resolved_stream_url = audio_ingest.source
+
     # Start transcription loop
     transcription_task = asyncio.create_task(transcription_loop(audio_ingest))
 
-    await broadcast({"type": "started", "session_id": session_mgr.state.session_id})
+    await broadcast({
+        "type": "started",
+        "session_id": session_mgr.state.session_id,
+        "stream_url": resolved_stream_url,
+    })
 
-    return {"status": "started", "session_id": session_mgr.state.session_id}
+    return {
+        "status": "started",
+        "session_id": session_mgr.state.session_id,
+        "stream_url": resolved_stream_url,
+    }
 
 
 @app.post("/api/upload")
@@ -354,6 +367,54 @@ async def export_json():
             filename=f"visualatc_{session_mgr.state.session_id}.json",
         )
     return JSONResponse({"error": "No active session"}, status_code=404)
+
+
+# ---------------------------------------------------------------------------
+# Audio proxy – lets the browser play the stream in an <audio> element
+# ---------------------------------------------------------------------------
+
+@app.get("/api/audio-proxy")
+async def audio_proxy():
+    """Proxy the resolved audio stream so the browser can play it."""
+    if not resolved_stream_url:
+        return JSONResponse({"error": "No active stream"}, status_code=404)
+
+    async def stream_audio():
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0),
+                headers={"User-Agent": USER_AGENT},
+            ) as client:
+                async with client.stream("GET", resolved_stream_url) as resp:
+                    async for chunk in resp.aiter_bytes(chunk_size=4096):
+                        yield chunk
+        except Exception as e:
+            logger.warning("Audio proxy error: %s", e)
+
+    # Try to infer content type from URL
+    url_lower = resolved_stream_url.lower()
+    if ".aac" in url_lower:
+        media_type = "audio/aac"
+    elif ".ogg" in url_lower:
+        media_type = "audio/ogg"
+    else:
+        media_type = "audio/mpeg"  # MP3 is most common for Icecast/Shoutcast
+
+    return StreamingResponse(
+        stream_audio(),
+        media_type=media_type,
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/api/stream-url")
+async def get_stream_url():
+    """Return the resolved stream URL for the current session."""
+    return {"stream_url": resolved_stream_url or ""}
 
 
 # ---------------------------------------------------------------------------

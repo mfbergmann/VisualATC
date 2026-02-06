@@ -102,6 +102,10 @@
           <button id="stop-btn" class="btn btn-small btn-danger" onclick="stopSession()">Stop</button>
           <button class="btn btn-small btn-outline" onclick="exportTxt()">Export .txt</button>
           <button class="btn btn-small btn-outline" onclick="exportJson()">Export .json</button>
+          <!-- Audio player -->
+          <div id="audio-player-wrapper" style="display:none">
+            <audio id="audio-player" controls preload="none" style="height:28px; vertical-align:middle;"></audio>
+          </div>
         </div>
         <div class="controls-right">
           <span id="stats-display">
