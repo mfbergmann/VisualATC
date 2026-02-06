@@ -75,6 +75,10 @@ function handleWSMessage(msg) {
       break;
     case 'status':
       showStatus(msg.message);
+      // Also show in transcript feed if session is active
+      if (sessionActive) {
+        appendSystemMessage(msg.message);
+      }
       break;
     case 'started':
       onSessionStarted(msg.session_id);
@@ -615,8 +619,29 @@ function showStatus(message) {
 function showError(message) {
   hideOverlay();
   console.error('Error:', message);
-  // Simple alert for now
-  alert('Error: ' + message);
+  if (sessionActive) {
+    appendSystemMessage('ERROR: ' + message, true);
+  } else {
+    alert('Error: ' + message);
+  }
+}
+
+function appendSystemMessage(text, isError) {
+  const feed = document.getElementById('transcript-feed');
+  if (!feed) return;
+  const empty = feed.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  const line = document.createElement('div');
+  line.className = 'transcript-line';
+  line.style.color = isError ? 'var(--red)' : 'var(--yellow)';
+  line.style.fontStyle = 'italic';
+  line.innerHTML = `
+    <span class="ts" style="color:${isError ? 'var(--red)' : 'var(--yellow)'}">SYS</span>
+    <span class="text">${escapeHtml(text)}</span>
+  `;
+  feed.appendChild(line);
+  feed.scrollTop = feed.scrollHeight;
 }
 
 // ---------------------------------------------------------------------------

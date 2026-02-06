@@ -89,7 +89,12 @@ async def transcription_loop(ingest: AudioIngest) -> None:
     base_ts = time.time()
 
     try:
+        got_audio = False
         async for audio_chunk in ingest.chunks():
+            if not got_audio:
+                got_audio = True
+                await broadcast({"type": "status", "message": f"Receiving audio from: {ingest.source}"})
+
             if not session_mgr.state or not session_mgr.state.is_running:
                 break
 
@@ -160,6 +165,15 @@ async def transcription_loop(ingest: AudioIngest) -> None:
                     "events": [e.model_dump() for e in session_mgr.state.events[-50:]],
                     "stats": session_mgr.get_state_snapshot(),
                 })
+
+        if not got_audio:
+            await broadcast({
+                "type": "error",
+                "message": (
+                    "No audio data received. Check that the URL is a valid audio stream. "
+                    "If it's a .pls or .m3u playlist, the resolved stream URL may be down or unreachable."
+                ),
+            })
 
     except asyncio.CancelledError:
         logger.info("Transcription loop cancelled")
