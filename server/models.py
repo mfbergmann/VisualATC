@@ -14,12 +14,6 @@ class InputMode(str, Enum):
     FILE = "file"
 
 
-class WhisperModel(str, Enum):
-    TINY = "tiny"
-    BASE = "base"
-    SMALL = "small"
-
-
 class EventType(str, Enum):
     GO_AROUND = "GO_AROUND"
     DIVERT = "DIVERT"
@@ -36,16 +30,18 @@ class EventType(str, Enum):
 class StartRequest(BaseModel):
     url: str = ""
     mode: InputMode = InputMode.STREAM
-    model_size: WhisperModel = WhisperModel.SMALL
-    chunk_duration: float = Field(default=7.0, ge=3.0, le=15.0)
+    model_size: str = "small"   # model id from transcriber.MODELS
+    radio_filter: bool = True
 
 
 class TranscriptSegment(BaseModel):
     ts: float
-    text: str
-    confidence: float = 0.0
-    raw: str = ""
+    text: str                            # number-normalised text shown in the UI
+    confidence: Optional[float] = None   # None when the engine gives no score
+    raw: str = ""                        # engine output as received
     duration: float = 0.0
+    audio_offset: float = 0.0            # seconds from start of stream/file
+    latency: float = 0.0                 # end of transmission -> transcript, seconds
 
 
 class ExtractedFields(BaseModel):
@@ -54,6 +50,7 @@ class ExtractedFields(BaseModel):
     heading: Optional[str] = None
     speed: Optional[str] = None
     frequency: Optional[str] = None
+    squawk: Optional[str] = None
 
 
 class Mention(BaseModel):
@@ -89,13 +86,14 @@ class SessionState(BaseModel):
     started_at: float = Field(default_factory=time.time)
     is_running: bool = False
     is_paused: bool = False
-    model_size: WhisperModel = WhisperModel.SMALL
+    model_size: str = "small"
     source_url: str = ""
     source_mode: InputMode = InputMode.STREAM
     transcript: list[TranscriptSegment] = Field(default_factory=list)
     flight_cards: dict[str, FlightCard] = Field(default_factory=dict)
     events: list[ATCEvent] = Field(default_factory=list)
     total_audio_seconds: float = 0.0
+    dropped_transmissions: int = 0
 
 
 class BookmarkEntry(BaseModel):

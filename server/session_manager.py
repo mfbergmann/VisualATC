@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,13 +12,11 @@ from typing import Optional
 from .models import (
     ATCEvent,
     BookmarkEntry,
-    ExtractedFields,
     FlightCard,
     InputMode,
     Mention,
     SessionState,
     TranscriptSegment,
-    WhisperModel,
 )
 
 logger = logging.getLogger("visualatc.session")
@@ -45,7 +42,7 @@ class SessionManager:
         self,
         source_url: str,
         source_mode: InputMode,
-        model_size: WhisperModel,
+        model_size: str,
     ) -> SessionState:
         """Create a new session."""
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -102,17 +99,10 @@ class SessionManager:
         if len(card.mentions) > 20:
             card.mentions = card.mentions[-20:]
 
-        # Update latest fields (only overwrite non-None)
-        if mention.extracted_fields.runway:
-            card.latest_fields.runway = mention.extracted_fields.runway
-        if mention.extracted_fields.altitude:
-            card.latest_fields.altitude = mention.extracted_fields.altitude
-        if mention.extracted_fields.heading:
-            card.latest_fields.heading = mention.extracted_fields.heading
-        if mention.extracted_fields.speed:
-            card.latest_fields.speed = mention.extracted_fields.speed
-        if mention.extracted_fields.frequency:
-            card.latest_fields.frequency = mention.extracted_fields.frequency
+        # Update latest fields (only overwrite with non-empty values)
+        for name, value in mention.extracted_fields.model_dump().items():
+            if value:
+                setattr(card.latest_fields, name, value)
 
         # Track sparkline
         self._mention_timestamps.setdefault(cs, []).append(mention.ts)
@@ -154,11 +144,16 @@ class SessionManager:
         return buckets
 
     def finalize_session(self) -> dict:
-        """Finalize session: write export files, return paths."""
+        """Stop the session and write export files."""
         if not self.state or not self._session_dir:
             return {}
-
         self.state.is_running = False
+        return self.write_exports()
+
+    def write_exports(self) -> dict:
+        """Write export.txt / export.json without changing session state."""
+        if not self.state or not self._session_dir:
+            return {}
 
         # Write export.txt
         txt_path = self._session_dir / "export.txt"
@@ -225,6 +220,7 @@ class SessionManager:
             "model_size": self.state.model_size,
             "source_url": self.state.source_url,
             "total_audio_seconds": round(self.state.total_audio_seconds, 1),
+            "dropped_transmissions": self.state.dropped_transmissions,
             "transcript_count": len(self.state.transcript),
             "flight_card_count": len(self.state.flight_cards),
             "event_count": len(self.state.events),

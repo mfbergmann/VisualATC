@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import shutil
 import signal
-import subprocess
 import tempfile
-from pathlib import Path
+from collections import deque
 from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
 
@@ -83,38 +81,50 @@ async def resolve_playlist_url(url: str) -> str:
     return url
 
 
-class AudioIngest:
-    """Async generator that yields PCM float32 chunks from a stream or file."""
+# Band-limit to the AM airband voice channel. Removes hum, DC and hiss outside
+# the speech band, and matches the audio chain ATC fine-tunes were trained on.
+RADIO_FILTER = (
+    "highpass=f=300:poles=2,highpass=f=300:poles=2,"
+    "lowpass=f=3400:poles=2,lowpass=f=3400:poles=2"
+)
 
-    def __init__(self, source: str, chunk_seconds: float = 7.0, is_file: bool = False):
+
+class AudioIngest:
+    """Decode a stream or file to 16 kHz mono float32 PCM with ffmpeg."""
+
+    def __init__(self, source: str, is_file: bool = False, radio_filter: bool = True,
+                 block_seconds: float = 0.1):
         self.source = source
-        self.chunk_seconds = chunk_seconds
         self.is_file = is_file
+        self.radio_filter = radio_filter
         self._process: Optional[asyncio.subprocess.Process] = None
+        self._stderr_task: Optional[asyncio.Task] = None
         self._stopped = False
-        self.chunk_size = int(SAMPLE_RATE * chunk_seconds * 4)  # float32 = 4 bytes
+        self.block_bytes = int(SAMPLE_RATE * block_seconds) * 4  # float32 = 4 bytes
+        self.stderr_tail: deque[str] = deque(maxlen=8)
 
     def _build_ffmpeg_cmd(self) -> list[str]:
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin"]
 
         if not self.is_file:
-            # For streams: set user-agent and reconnect options
             cmd += [
                 "-user_agent", USER_AGENT,
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "5",
-                "-timeout", "15000000",  # 15s timeout in microseconds
+                "-reconnect_on_network_error", "1",
+                "-reconnect_delay_max", "10",
+                "-rw_timeout", "15000000",  # 15 s, microseconds
             ]
 
+        cmd += ["-i", self.source, "-vn"]
+        if self.radio_filter:
+            cmd += ["-af", RADIO_FILTER]
         cmd += [
-            "-i", self.source,
-            "-vn",                     # no video
-            "-acodec", "pcm_f32le",    # float32 little-endian
-            "-ar", str(SAMPLE_RATE),   # 16kHz
-            "-ac", str(CHANNELS),      # mono
-            "-f", "f32le",             # raw PCM output
-            "pipe:1",                  # stdout
+            "-acodec", "pcm_f32le",
+            "-ar", str(SAMPLE_RATE),
+            "-ac", str(CHANNELS),
+            "-f", "f32le",
+            "pipe:1",
         ]
         return cmd
 
@@ -122,24 +132,19 @@ class AudioIngest:
         if not check_ffmpeg():
             raise RuntimeError("ffmpeg not found on PATH. Please install ffmpeg.")
 
-        # Resolve playlist URLs (.pls, .m3u) to actual stream URLs
         if not self.is_file:
             self.source = await resolve_playlist_url(self.source)
 
         cmd = self._build_ffmpeg_cmd()
         logger.info("Starting ffmpeg: %s", " ".join(cmd))
-
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-
-        # Start a task to log stderr for debugging
-        asyncio.create_task(self._log_stderr())
+        self._stderr_task = asyncio.create_task(self._log_stderr())
 
     async def _log_stderr(self) -> None:
-        """Read ffmpeg stderr and log it for debugging."""
         if not self._process or not self._process.stderr:
             return
         try:
@@ -149,6 +154,7 @@ class AudioIngest:
                     break
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
+                    self.stderr_tail.append(text)
                     logger.warning("ffmpeg: %s", text)
         except Exception:
             pass
@@ -164,41 +170,24 @@ class AudioIngest:
                     self._process.kill()
                 except ProcessLookupError:
                     pass
+        if self._stderr_task:
+            self._stderr_task.cancel()
 
-    async def chunks(self) -> AsyncIterator[np.ndarray]:
-        """Yield numpy float32 arrays of audio chunks."""
+    async def blocks(self) -> AsyncIterator[np.ndarray]:
+        """Yield float32 sample blocks as ffmpeg produces them, until EOF."""
         if not self._process or not self._process.stdout:
             raise RuntimeError("AudioIngest not started")
 
-        buffer = b""
+        remainder = b""
         while not self._stopped:
-            try:
-                data = await asyncio.wait_for(
-                    self._process.stdout.read(self.chunk_size - len(buffer)),
-                    timeout=15.0,
-                )
-            except asyncio.TimeoutError:
-                if self._stopped:
-                    break
-                if buffer:
-                    # Yield what we have
-                    arr = np.frombuffer(buffer, dtype=DTYPE).copy()
-                    buffer = b""
-                    yield arr
-                continue
-
+            data = await self._process.stdout.read(self.block_bytes)
             if not data:
-                # EOF
-                if buffer:
-                    arr = np.frombuffer(buffer, dtype=DTYPE).copy()
-                    yield arr
                 break
-
-            buffer += data
-            if len(buffer) >= self.chunk_size:
-                arr = np.frombuffer(buffer[: self.chunk_size], dtype=DTYPE).copy()
-                buffer = buffer[self.chunk_size:]
-                yield arr
+            data = remainder + data
+            usable = len(data) - (len(data) % 4)
+            remainder = data[usable:]
+            if usable:
+                yield np.frombuffer(data[:usable], dtype=DTYPE).copy()
 
     @property
     def is_running(self) -> bool:

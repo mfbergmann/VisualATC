@@ -4,9 +4,20 @@ set -euo pipefail
 echo "=== VisualATC Setup ==="
 echo ""
 
+# Optional back ends:  bash setup.sh --transformers   (Nemotron, US-ATC Whisper LoRA)
+#                      bash setup.sh --nemo           (Parakeet ATC fine-tune)
+EXTRAS=()
+for arg in "$@"; do
+    case "$arg" in
+        --transformers) EXTRAS+=("requirements-transformers.txt") ;;
+        --nemo)         EXTRAS+=("requirements-nemo.txt") ;;
+        *) echo "Unknown option: $arg"; exit 1 ;;
+    esac
+done
+
 # Check Python version
 PYTHON=""
-for cmd in python3.11 python3.10 python3.9 python3; do
+for cmd in python3.12 python3.11 python3.10 python3; do
     if command -v "$cmd" &>/dev/null; then
         PYTHON="$cmd"
         break
@@ -14,7 +25,7 @@ for cmd in python3.11 python3.10 python3.9 python3; do
 done
 
 if [ -z "$PYTHON" ]; then
-    echo "ERROR: Python 3.9+ is required but not found."
+    echo "ERROR: Python 3.10+ is required but not found."
     exit 1
 fi
 
@@ -44,6 +55,10 @@ source venv/bin/activate
 echo "Installing dependencies..."
 pip install --upgrade pip -q
 pip install -r requirements.txt -q
+for req in "${EXTRAS[@]+"${EXTRAS[@]}"}"; do
+    echo "Installing optional back end from $req (this can take a while)..."
+    pip install -r "$req" -q
+done
 
 echo ""
 echo "=== Setup complete! ==="

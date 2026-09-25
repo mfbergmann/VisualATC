@@ -48,12 +48,19 @@
 
         <!-- Model selection -->
         <div class="input-group">
-          <label for="model-select">Whisper Model</label>
-          <select id="model-select">
-            <option value="tiny">Tiny (~75MB, fastest, lower accuracy)</option>
-            <option value="base">Base (~150MB, fast, medium accuracy)</option>
-            <option value="small" selected>Small (~500MB, medium speed, good accuracy)</option>
+          <label for="model-select">Speech Recognition Model</label>
+          <select id="model-select" onchange="updateModelInfo()">
+            <option value="small" selected>Whisper small.en</option>
           </select>
+          <small id="model-info"></small>
+        </div>
+
+        <!-- Audio options -->
+        <div class="input-group checkbox-group">
+          <label title="300–3400 Hz band-pass, matching AM airband audio and what ATC fine-tunes were trained on">
+            <input type="checkbox" id="radio-filter" checked>
+            Radio voice-band filter (recommended for scanner feeds)
+          </label>
         </div>
 
         <!-- Confirmation checkbox -->
@@ -89,6 +96,7 @@
           <li><strong>ATLAS</strong> – Real-time ATC transcription with Docker deployment (github.com/amidstdebug/atlas)</li>
           <li><strong>WhisperATC</strong> – Fine-tuned Whisper models for ATC audio (github.com/jlvdoorn/WhisperATC)</li>
           <li><strong>jack-tol/fine-tuning-whisper-on-atc-data</strong> – 84% improvement in ATC transcription accuracy</li>
+          <li><strong>thomaseibner/whisper-large-v3-turbo-us-atc-v2</strong> – US ATC LoRA for Whisper large-v3-turbo (huggingface.co)</li>
         </ul>
       </div>
     </div>
@@ -113,6 +121,8 @@
             <span class="stat">Flights: <strong id="stat-flights">0</strong></span>
             <span class="stat">Events: <strong id="stat-events">0</strong></span>
             <span class="stat">Audio: <strong id="stat-audio">0:00</strong></span>
+            <span class="stat" title="Time from detected end of transmission to transcript">Lag: <strong id="stat-lag">–</strong></span>
+            <span class="stat" id="stat-model"></span>
           </span>
         </div>
       </div>
