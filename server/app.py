@@ -6,35 +6,26 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
 import time
 from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .audio_ingest import AudioIngest, USER_AGENT, resolve_playlist_url, save_upload
-from .models import (
-    ATCEvent,
-    EventType,
-    ExtractedFields,
-    InputMode,
-    Mention,
-    StartRequest,
-    TranscriptSegment,
-    WhisperModel,
-)
+from .audio_ingest import AudioIngest, USER_AGENT, save_upload
+from .models import InputMode, Mention, StartRequest, TranscriptSegment
 from .nlp_extractor import ATCExtractor
+from .segmenter import SAMPLE_RATE, Transmission, TransmissionSegmenter
 from .session_manager import (
     SessionManager,
     add_bookmark,
     load_bookmarks,
     remove_bookmark,
 )
-from .transcriber import Transcriber
+from .transcriber import ASREngine, MODELS_BY_ID, check_available, create_engine, list_models
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,20 +33,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger("visualatc.app")
 
-app = FastAPI(title="VisualATC", version="1.0.0")
+app = FastAPI(title="VisualATC", version="1.1.0")
 
-# Serve static files
 STATIC_DIR = Path(__file__).parent.parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+# Live streams: if transcription falls this many transmissions behind, the
+# oldest queued ones are dropped so the transcript stays near real time.
+MAX_STREAM_BACKLOG = 10
+# Files: bounded queue gives back-pressure to ffmpeg instead of dropping.
+FILE_QUEUE_SIZE = 4
+
 # Global state
 session_mgr = SessionManager()
-transcriber: Optional[Transcriber] = None
+transcriber: Optional[ASREngine] = None
 extractor = ATCExtractor()
 audio_ingest: Optional[AudioIngest] = None
 transcription_task: Optional[asyncio.Task] = None
 connected_websockets: list[WebSocket] = []
 resolved_stream_url: Optional[str] = None  # actual stream URL after playlist resolution
+upload_path: Optional[str] = None           # temp file for the current upload
+model_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -72,120 +70,174 @@ async def broadcast(msg: dict) -> None:
         except Exception:
             dead.append(ws)
     for ws in dead:
-        connected_websockets.remove(ws)
+        if ws in connected_websockets:
+            connected_websockets.remove(ws)
+
+
+def _state_message() -> dict:
+    return {
+        "type": "state_update",
+        "flight_cards": {
+            cs: card.model_dump() for cs, card in session_mgr.state.flight_cards.items()
+        },
+        "events": [e.model_dump() for e in session_mgr.state.events[-50:]],
+        "stats": session_mgr.get_state_snapshot(),
+    }
 
 
 # ---------------------------------------------------------------------------
-# Transcription loop
+# Pipeline: ffmpeg -> segmenter -> queue -> ASR -> extraction -> UI
 # ---------------------------------------------------------------------------
 
-async def transcription_loop(ingest: AudioIngest) -> None:
-    """Main transcription loop: read audio chunks, transcribe, extract, broadcast."""
-    global transcriber, session_mgr
+async def reader_loop(ingest: AudioIngest, queue: asyncio.Queue, is_file: bool) -> None:
+    """Read PCM from ffmpeg, cut it into transmissions and queue them."""
+    segmenter = TransmissionSegmenter()
+    got_audio = False
+    wall_start = time.time()
 
-    if not transcriber or not transcriber.is_loaded:
-        logger.error("Transcriber not loaded")
-        return
-
-    chunk_count = 0
-    base_ts = time.time()
+    async def enqueue(tx: Transmission) -> None:
+        state = session_mgr.state
+        # Wall-clock time the transmission started. For files, decoding is
+        # faster than real time, so use the position in the file instead.
+        if is_file:
+            ts = state.started_at + tx.start_s
+        else:
+            ts = time.time() - segmenter.seconds_since(tx.start_s)
+        item = (tx, ts, time.time())
+        if is_file:
+            await queue.put(item)
+            return
+        if state.is_paused:
+            return
+        while queue.qsize() >= MAX_STREAM_BACKLOG:
+            queue.get_nowait()
+            state.dropped_transmissions += 1
+            if state.dropped_transmissions in (1, 10) or state.dropped_transmissions % 50 == 0:
+                await broadcast({
+                    "type": "status",
+                    "message": (
+                        f"Transcription is falling behind the stream; skipped "
+                        f"{state.dropped_transmissions} transmission(s). A faster model "
+                        f"or a GPU will help."
+                    ),
+                })
+        queue.put_nowait(item)
 
     try:
-        got_audio = False
-        async for audio_chunk in ingest.chunks():
+        async for block in ingest.blocks():
             if not got_audio:
                 got_audio = True
                 await broadcast({"type": "status", "message": f"Receiving audio from: {ingest.source}"})
-
-            if not session_mgr.state or not session_mgr.state.is_running:
+            state = session_mgr.state
+            if not state or not state.is_running:
                 break
+            state.total_audio_seconds += len(block) / SAMPLE_RATE
+            for tx in segmenter.push(block):
+                await enqueue(tx)
 
-            if session_mgr.state.is_paused:
-                await asyncio.sleep(0.5)
-                continue
-
-            chunk_count += 1
-            chunk_duration = len(audio_chunk) / 16000  # samples / sample_rate
-            session_mgr.state.total_audio_seconds += chunk_duration
-            chunk_ts = time.time()
-
-            # Transcribe in thread pool (blocking operation)
-            loop = asyncio.get_event_loop()
-            segments = await loop.run_in_executor(
-                None, transcriber.transcribe_chunk, audio_chunk
-            )
-
-            for seg in segments:
-                text = seg["text"]
-                confidence = seg.get("confidence", 0.0)
-
-                # Create transcript segment
-                ts_segment = TranscriptSegment(
-                    ts=chunk_ts,
-                    text=text,
-                    confidence=confidence,
-                    raw=text,
-                    duration=seg.get("end", 0) - seg.get("start", 0),
-                )
-                session_mgr.add_transcript_segment(ts_segment)
-
-                # Extract entities
-                extraction = extractor.extract_all(text, chunk_ts)
-
-                # Process callsigns -> mentions
-                for cs_info in extraction["callsigns"]:
-                    mention = Mention(
-                        ts=chunk_ts,
-                        callsign_canonical=cs_info["canonical"],
-                        aliases=[cs_info["alias"]],
-                        extracted_fields=extraction["fields"],
-                        raw_text=text,
-                    )
-                    session_mgr.add_mention(mention)
-
-                # Process events
-                for event in extraction["events"]:
-                    session_mgr.add_event(event)
-
-                # Broadcast update to all connected clients
-                await broadcast({
-                    "type": "transcript",
-                    "segment": ts_segment.model_dump(),
-                    "callsigns": extraction["callsigns"],
-                    "fields": extraction["fields"].model_dump(),
-                    "events": [e.model_dump() for e in extraction["events"]],
-                })
-
-            # Periodically broadcast full state update
-            if chunk_count % 5 == 0:
-                await broadcast({
-                    "type": "state_update",
-                    "flight_cards": {
-                        cs: card.model_dump()
-                        for cs, card in session_mgr.state.flight_cards.items()
-                    },
-                    "events": [e.model_dump() for e in session_mgr.state.events[-50:]],
-                    "stats": session_mgr.get_state_snapshot(),
-                })
+        for tx in segmenter.flush():
+            await enqueue(tx)
 
         if not got_audio:
+            detail = " | ".join(ingest.stderr_tail) or "no output from ffmpeg"
             await broadcast({
                 "type": "error",
                 "message": (
-                    "No audio data received. Check that the URL is a valid audio stream. "
-                    "If it's a .pls or .m3u playlist, the resolved stream URL may be down or unreachable."
+                    "No audio received. Check that the URL is a live audio stream "
+                    f"(ffmpeg: {detail})"
                 ),
             })
-
+        else:
+            logger.info("Audio input ended after %.1fs", time.time() - wall_start)
     except asyncio.CancelledError:
-        logger.info("Transcription loop cancelled")
+        raise
+    except Exception:
+        await queue.put(None)
+        raise
+    await queue.put(None)  # sentinel: no more audio
+
+
+async def transcriber_loop(queue: asyncio.Queue, engine: ASREngine) -> None:
+    """Transcribe queued transmissions and publish results."""
+    loop = asyncio.get_running_loop()
+    count = 0
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        tx, ts, queued_at = item
+        state = session_mgr.state
+        if not state or not state.is_running:
+            break
+        while state.is_paused and state.is_running:
+            await asyncio.sleep(0.25)
+
+        segments = await loop.run_in_executor(None, engine.transcribe_chunk, tx.audio)
+        latency = time.time() - queued_at
+        count += 1
+
+        for seg in segments:
+            raw = seg["text"]
+            extraction = extractor.extract_all(raw, ts)
+            ts_segment = TranscriptSegment(
+                ts=ts + seg.get("start", 0.0),
+                text=extraction["normalized"],
+                raw=raw,
+                confidence=seg.get("confidence"),
+                duration=seg.get("end", 0.0) - seg.get("start", 0.0),
+                audio_offset=tx.start_s + seg.get("start", 0.0),
+                latency=round(latency, 2),
+            )
+            session_mgr.add_transcript_segment(ts_segment)
+
+            for cs_info in extraction["callsigns"]:
+                session_mgr.add_mention(Mention(
+                    ts=ts_segment.ts,
+                    callsign_canonical=cs_info["canonical"],
+                    aliases=[cs_info["alias"]],
+                    extracted_fields=extraction["fields"],
+                    raw_text=ts_segment.text,
+                ))
+            for event in extraction["events"]:
+                session_mgr.add_event(event)
+
+            await broadcast({
+                "type": "transcript",
+                "segment": ts_segment.model_dump(),
+                "callsigns": extraction["callsigns"],
+                "fields": extraction["fields"].model_dump(),
+                "events": [e.model_dump() for e in extraction["events"]],
+            })
+
+        if count % 3 == 0:
+            await broadcast(_state_message())
+
+
+async def run_pipeline(ingest: AudioIngest, engine: ASREngine, is_file: bool) -> None:
+    queue: asyncio.Queue = asyncio.Queue(maxsize=FILE_QUEUE_SIZE if is_file else 0)
+    reader = asyncio.create_task(reader_loop(ingest, queue, is_file))
+    try:
+        await transcriber_loop(queue, engine)
+        if reader.done() and not reader.cancelled() and reader.exception():
+            raise reader.exception()
+    except asyncio.CancelledError:
+        logger.info("Transcription pipeline cancelled")
+        raise
     except Exception as e:
-        logger.exception("Transcription loop error: %s", e)
+        logger.exception("Transcription pipeline error: %s", e)
         await broadcast({"type": "error", "message": str(e)})
     finally:
-        await broadcast({"type": "stopped"})
+        if not reader.done():
+            # The reader may be blocked on a full queue after a stop.
+            reader.cancel()
+            try:
+                await reader
+            except (asyncio.CancelledError, Exception):
+                pass
         if session_mgr.state:
             session_mgr.state.is_running = False
+            await broadcast(_state_message())
+            await broadcast({"type": "finished"})
 
 
 # ---------------------------------------------------------------------------
@@ -197,91 +249,99 @@ async def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
-@app.post("/api/start")
-async def start_session(req: StartRequest):
-    """Start a new transcription session from a stream URL."""
-    global transcriber, audio_ingest, transcription_task, resolved_stream_url
-
-    # Stop any existing session
-    await _stop_session()
-
-    # Load model if needed
-    if transcriber is None or transcriber.model_size != req.model_size:
-        transcriber = Transcriber(model_size=req.model_size)
-        await broadcast({"type": "status", "message": f"Loading {req.model_size} model..."})
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, transcriber.load_model)
-        await broadcast({"type": "status", "message": "Model loaded."})
-
-    # Create session
-    session_mgr.create_session(req.url, req.mode, req.model_size)
-
-    # Start audio ingest
-    is_file = req.mode == InputMode.FILE
-    audio_ingest = AudioIngest(
-        source=req.url,
-        chunk_seconds=req.chunk_duration,
-        is_file=is_file,
-    )
-    await audio_ingest.start()
-
-    # Store resolved URL for the audio proxy
-    resolved_stream_url = audio_ingest.source
-
-    # Start transcription loop
-    transcription_task = asyncio.create_task(transcription_loop(audio_ingest))
-
-    await broadcast({
-        "type": "started",
-        "session_id": session_mgr.state.session_id,
-        "stream_url": resolved_stream_url,
-    })
-
+@app.get("/api/models")
+async def get_models():
     return {
-        "status": "started",
-        "session_id": session_mgr.state.session_id,
-        "stream_url": resolved_stream_url,
+        "models": list_models(),
+        "loaded": transcriber.model_id if transcriber else None,
+        "default": "small",
     }
 
 
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...), model_size: str = "small"):
-    """Upload a local audio file and start transcription."""
-    global transcriber, audio_ingest, transcription_task
+async def _ensure_engine(model_id: str) -> ASREngine:
+    """Load (or reuse) the engine for ``model_id``."""
+    global transcriber
+    spec = MODELS_BY_ID.get(model_id)
+    if spec is None:
+        raise ValueError(f"Unknown model '{model_id}'")
+    ok, reason = check_available(spec)
+    if not ok:
+        raise ValueError(f"{spec.label} is not installed. {reason}")
 
+    async with model_lock:
+        if transcriber is None or transcriber.model_id != model_id:
+            engine = create_engine(model_id)
+            await broadcast({"type": "status", "message": f"Loading {spec.label} (first use downloads {spec.size})..."})
+            await asyncio.get_running_loop().run_in_executor(None, engine.load_model)
+            transcriber = engine
+            await broadcast({"type": "status", "message": f"Model loaded on {engine.device}."})
+    return transcriber
+
+
+async def _begin(source: str, label: str, mode: InputMode, model_id: str, radio_filter: bool) -> dict:
+    global audio_ingest, transcription_task, resolved_stream_url
+
+    try:
+        engine = await _ensure_engine(model_id)
+    except Exception as e:
+        logger.exception("Model load failed")
+        return {"status": "error", "error": f"Could not load model: {e or type(e).__name__}"}
+
+    is_file = mode == InputMode.FILE
+    ingest = AudioIngest(source=source, is_file=is_file, radio_filter=radio_filter)
+    try:
+        await ingest.start()
+    except Exception as e:
+        return {"status": "error", "error": f"Could not open audio: {e or type(e).__name__}"}
+
+    session_mgr.create_session(label, mode, model_id)
+    audio_ingest = ingest
+    resolved_stream_url = None if is_file else ingest.source
+    transcription_task = asyncio.create_task(run_pipeline(ingest, engine, is_file))
+
+    info = {
+        "session_id": session_mgr.state.session_id,
+        "stream_url": resolved_stream_url,
+        "mode": mode.value,
+        "model": engine.spec.label,
+        "device": engine.device,
+    }
+    await broadcast({"type": "started", **info})
+    return {"status": "started", **info}
+
+
+@app.post("/api/start")
+async def start_session(req: StartRequest):
+    """Start a new transcription session from a stream URL."""
+    await _stop_session()
+    if not req.url:
+        return JSONResponse({"status": "error", "error": "url required"}, status_code=400)
+    result = await _begin(req.url, req.url, req.mode, req.model_size, req.radio_filter)
+    return JSONResponse(result, status_code=200 if result["status"] == "started" else 400)
+
+
+@app.post("/api/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    model_size: str = Form("small"),
+    radio_filter: bool = Form(True),
+):
+    """Upload a local audio file and start transcription."""
+    global upload_path
     await _stop_session()
 
-    # Save upload
     data = await file.read()
-    suffix = Path(file.filename or "audio.wav").suffix
-    tmp_path = await save_upload(data, suffix=suffix)
+    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+    upload_path = await save_upload(data, suffix=suffix)
 
-    # Load model if needed
-    wm = WhisperModel(model_size)
-    if transcriber is None or transcriber.model_size != model_size:
-        transcriber = Transcriber(model_size=model_size)
-        await broadcast({"type": "status", "message": f"Loading {model_size} model..."})
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, transcriber.load_model)
-        await broadcast({"type": "status", "message": "Model loaded."})
-
-    # Create session
-    session_mgr.create_session(file.filename or "uploaded_file", InputMode.FILE, wm)
-
-    # Start audio ingest
-    audio_ingest = AudioIngest(source=tmp_path, chunk_seconds=7.0, is_file=True)
-    await audio_ingest.start()
-
-    # Start transcription loop
-    transcription_task = asyncio.create_task(transcription_loop(audio_ingest))
-
-    await broadcast({"type": "started", "session_id": session_mgr.state.session_id})
-    return {"status": "started", "session_id": session_mgr.state.session_id}
+    result = await _begin(upload_path, file.filename or "uploaded_file", InputMode.FILE,
+                          model_size, radio_filter)
+    return JSONResponse(result, status_code=200 if result["status"] == "started" else 400)
 
 
 @app.post("/api/pause")
 async def pause_session():
-    if session_mgr.state:
+    if session_mgr.state and session_mgr.state.is_running:
         session_mgr.state.is_paused = not session_mgr.state.is_paused
         status = "paused" if session_mgr.state.is_paused else "resumed"
         await broadcast({"type": status})
@@ -291,13 +351,19 @@ async def pause_session():
 
 @app.post("/api/stop")
 async def stop_session():
-    result = await _stop_session()
-    return result
+    return await _stop_session()
 
 
 async def _stop_session() -> dict:
-    """Stop the current session."""
-    global audio_ingest, transcription_task
+    """Stop the current session and write exports."""
+    global audio_ingest, transcription_task, resolved_stream_url, upload_path
+
+    if session_mgr.state:
+        session_mgr.state.is_running = False
+
+    if audio_ingest:
+        await audio_ingest.stop()
+        audio_ingest = None
 
     if transcription_task and not transcription_task.done():
         transcription_task.cancel()
@@ -305,11 +371,18 @@ async def _stop_session() -> dict:
             await transcription_task
         except asyncio.CancelledError:
             pass
+    transcription_task = None
+    resolved_stream_url = None
 
-    if audio_ingest:
-        await audio_ingest.stop()
-        audio_ingest = None
+    if upload_path:
+        try:
+            os.unlink(upload_path)
+        except OSError:
+            pass
+        upload_path = None
 
+    if not session_mgr.state:
+        return {"status": "no_session"}
     result = session_mgr.finalize_session()
     await broadcast({"type": "stopped", **result})
     return {"status": "stopped", **result}
@@ -345,8 +418,8 @@ async def get_transcript():
 
 @app.get("/api/export/txt")
 async def export_txt():
-    """Export transcript as .txt file."""
-    result = session_mgr.finalize_session()
+    """Export transcript as .txt (does not stop the session)."""
+    result = session_mgr.write_exports()
     if "export_txt" in result:
         return FileResponse(
             result["export_txt"],
@@ -358,8 +431,8 @@ async def export_txt():
 
 @app.get("/api/export/json")
 async def export_json():
-    """Export entities/events as .json file."""
-    result = session_mgr.finalize_session()
+    """Export entities/events as .json (does not stop the session)."""
+    result = session_mgr.write_exports()
     if "export_json" in result:
         return FileResponse(
             result["export_json"],
@@ -465,13 +538,7 @@ async def websocket_endpoint(ws: WebSocket):
         # Send current state on connect
         if session_mgr.state:
             await ws.send_text(json.dumps({
-                "type": "state_update",
-                "flight_cards": {
-                    cs: card.model_dump()
-                    for cs, card in session_mgr.state.flight_cards.items()
-                },
-                "events": [e.model_dump() for e in session_mgr.state.events[-50:]],
-                "stats": session_mgr.get_state_snapshot(),
+                **_state_message(),
                 "transcript": [s.model_dump() for s in session_mgr.state.transcript[-50:]],
             }, default=str))
 

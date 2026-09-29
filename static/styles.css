@@ -73,6 +73,7 @@ html, body {
 .badge-running { background: var(--green); color: var(--bg); animation: pulse 2s infinite; }
 .badge-paused { background: var(--yellow); color: var(--bg); }
 .badge-stopped { background: var(--text-dim); color: var(--bg); }
+.badge-finished { background: var(--accent); color: var(--bg); }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -248,8 +249,17 @@ html, body {
 .btn-outline { background: transparent; }
 
 /* Controls bar */
+#live-view {
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
 #controls-bar {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: space-between;
   align-items: center;
   padding: 8px 16px;
@@ -499,6 +509,11 @@ html, body {
 .field-heading { background: rgba(188, 140, 255, 0.15); color: var(--purple); }
 .field-speed { background: rgba(210, 153, 34, 0.15); color: var(--yellow); }
 .field-frequency { background: rgba(247, 120, 186, 0.15); color: var(--pink); }
+.field-squawk { background: rgba(219, 109, 40, 0.15); color: var(--orange); }
+
+.transcript-line.low-confidence .text { opacity: 0.6; font-style: italic; }
+#model-info { display: block; margin-top: 4px; line-height: 1.4; }
+select optgroup { font-style: normal; font-weight: 600; }
 
 .flight-card-events {
   display: flex;

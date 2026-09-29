@@ -15,6 +15,8 @@ let eventTypeFilter = '';
 let flightCardSort = 'recent';
 let startTime = 0;
 let audioTimer = null;
+let sessionMode = 'stream';
+let availableModels = [];
 
 const TRACKER_URL_TEMPLATE = 'https://flightaware.com/live/flight/{CALLSIGN}';
 
@@ -23,6 +25,7 @@ const TRACKER_URL_TEMPLATE = 'https://flightaware.com/live/flight/{CALLSIGN}';
 // ---------------------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
   connectWebSocket();
+  loadModels();
   loadBookmarks();
   updateStartButton();
 
@@ -81,10 +84,18 @@ function handleWSMessage(msg) {
       }
       break;
     case 'started':
-      onSessionStarted(msg.session_id, msg.stream_url);
+      onSessionStarted(msg);
       break;
     case 'stopped':
       onSessionStopped(msg);
+      break;
+    case 'finished':
+      // Input ended (file done or stream closed); results stay on screen.
+      if (sessionActive) {
+        stopAudioTimer();
+        setStatusBadge('finished');
+        appendSystemMessage('Audio input ended. Export or stop the session when ready.');
+      }
       break;
     case 'paused':
       isPaused = true;
@@ -128,8 +139,53 @@ function updateStartButton() {
   document.getElementById('start-btn').disabled = !(check && hasInput);
 }
 
+async function loadModels() {
+  try {
+    const resp = await fetch('/api/models');
+    const data = await resp.json();
+    availableModels = data.models || [];
+    const select = document.getElementById('model-select');
+    let saved = null;
+    try { saved = localStorage.getItem('visualatc.model'); } catch (e) { /* storage unavailable */ }
+    const preferred = saved || data.loaded || data.default;
+    select.innerHTML = '';
+    const groups = [
+      ['ATC-tuned models', m => m.atc_tuned],
+      ['General-purpose models', m => !m.atc_tuned],
+    ];
+    groups.forEach(([label, test]) => {
+      const og = document.createElement('optgroup');
+      og.label = label;
+      availableModels.filter(test).forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = `${m.label}${m.size ? ' · ' + m.size : ''}${m.available ? '' : ' (not installed)'}`;
+        opt.disabled = !m.available;
+        og.appendChild(opt);
+      });
+      if (og.children.length) select.appendChild(og);
+    });
+    const pick = availableModels.find(m => m.id === preferred && m.available)
+      || availableModels.find(m => m.id === data.default);
+    if (pick) select.value = pick.id;
+    updateModelInfo();
+  } catch (err) {
+    console.error('Failed to load models:', err);
+  }
+}
+
+function updateModelInfo() {
+  const id = document.getElementById('model-select').value;
+  const m = availableModels.find(x => x.id === id);
+  const info = document.getElementById('model-info');
+  if (!m) { info.textContent = ''; return; }
+  info.textContent = m.description + (m.available ? '' : ` Install: ${m.unavailable_reason}`);
+  try { localStorage.setItem('visualatc.model', id); } catch (e) { /* storage unavailable */ }
+}
+
 async function startSession() {
   const modelSize = document.getElementById('model-select').value;
+  const radioFilter = document.getElementById('radio-filter').checked;
 
   if (inputMode === 'file') {
     const fileInput = document.getElementById('file-upload');
@@ -140,6 +196,7 @@ async function startSession() {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('model_size', modelSize);
+    formData.append('radio_filter', radioFilter ? 'true' : 'false');
 
     try {
       const resp = await fetch('/api/upload', { method: 'POST', body: formData });
@@ -147,7 +204,7 @@ async function startSession() {
       if (data.status === 'started') {
         // Will receive 'started' via WebSocket
       } else {
-        showError('Failed to start: ' + JSON.stringify(data));
+        showError('Failed to start: ' + (data.error || JSON.stringify(data)));
         hideOverlay();
       }
     } catch (err) {
@@ -163,11 +220,11 @@ async function startSession() {
       const resp = await fetch('/api/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, mode: 'stream', model_size: modelSize }),
+        body: JSON.stringify({ url, mode: 'stream', model_size: modelSize, radio_filter: radioFilter }),
       });
       const data = await resp.json();
       if (data.status !== 'started') {
-        showError('Failed to start: ' + JSON.stringify(data));
+        showError('Failed to start: ' + (data.error || JSON.stringify(data)));
         hideOverlay();
       }
     } catch (err) {
@@ -177,7 +234,9 @@ async function startSession() {
   }
 }
 
-function onSessionStarted(sessionId, streamUrl) {
+function onSessionStarted(msg) {
+  const streamUrl = msg.stream_url;
+  sessionMode = msg.mode || inputMode;
   sessionActive = true;
   isPaused = false;
   transcriptSegments = [];
@@ -193,11 +252,13 @@ function onSessionStarted(sessionId, streamUrl) {
   renderTranscript();
   renderFlightCards();
   renderEvents();
+  document.getElementById('stat-model').textContent = msg.model ? `${msg.model} · ${msg.device}` : '';
+  document.getElementById('stat-lag').textContent = '–';
 
   // Set up audio player – use the proxy endpoint so the browser can play it
   const audioPlayer = document.getElementById('audio-player');
   const audioWrapper = document.getElementById('audio-player-wrapper');
-  if (streamUrl && inputMode === 'stream') {
+  if (streamUrl && sessionMode === 'stream') {
     audioPlayer.src = '/api/audio-proxy';
     audioWrapper.style.display = 'inline-block';
     // Don't autoplay – let user click play when ready
@@ -272,6 +333,9 @@ function addTranscriptSegment(segment, callsigns, fields, segEvents) {
   if (isDup) return;
 
   transcriptSegments.push({ ...segment, callsigns, fields, events: segEvents });
+  if (segment.latency) {
+    document.getElementById('stat-lag').textContent = segment.latency.toFixed(1) + 's';
+  }
   updateStats();
   appendTranscriptLine(segment, callsigns, segEvents);
 }
@@ -294,9 +358,17 @@ function appendTranscriptLine(segment, callsigns, segEvents) {
 
   const line = document.createElement('div');
   line.className = 'transcript-line';
+  const lowConf = segment.confidence !== null && segment.confidence !== undefined && segment.confidence < 0.5;
+  if (lowConf) line.classList.add('low-confidence');
+  const tip = [];
+  if (segment.confidence !== null && segment.confidence !== undefined) tip.push(`confidence ${Math.round(segment.confidence * 100)}%`);
+  if (segment.raw && segment.raw !== segment.text) tip.push(`heard: "${segment.raw}"`);
+  if (tip.length) line.title = tip.join(' · ');
 
-  const elapsed = segment.ts - (startTime / 1000);
-  const tsStr = formatTime(elapsed > 0 ? elapsed : transcriptSegments.length * 7);
+  // Streams: local clock time. Files: position in the recording.
+  const tsStr = sessionMode === 'file'
+    ? formatTime(segment.audio_offset || 0)
+    : new Date(segment.ts * 1000).toLocaleTimeString([], { hour12: false });
 
   let textHtml = escapeHtml(segment.text);
 
@@ -426,6 +498,7 @@ function createFlightCardElement(cs, card) {
   if (f.heading) fieldsHtml += `<span class="field-badge field-heading">HDG ${f.heading}</span>`;
   if (f.speed) fieldsHtml += `<span class="field-badge field-speed">SPD ${f.speed}</span>`;
   if (f.frequency) fieldsHtml += `<span class="field-badge field-frequency">FREQ ${f.frequency}</span>`;
+  if (f.squawk) fieldsHtml += `<span class="field-badge field-squawk">SQK ${f.squawk}</span>`;
 
   // Events
   let eventsHtml = '';

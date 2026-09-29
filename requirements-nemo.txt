@@ -1,0 +1,7 @@
+# Optional: NVIDIA NeMo, for Parakeet models distributed as .nemo checkpoints.
+# NeMo is a large install; Linux with an NVIDIA GPU is the supported setup.
+# Install on top of requirements.txt:  pip install -r requirements-nemo.txt
+Cython
+packaging
+nemo_toolkit[asr]>=2.4
+huggingface_hub>=0.34
